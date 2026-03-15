@@ -33,6 +33,10 @@ import {
   serializeRevisionSecurely,
 } from '~/server/models/serializers';
 import { configManager } from '~/server/service/config-manager/config-manager';
+import {
+  extractNewMentionUserIds,
+  getContributorUserIds,
+} from '~/server/service/page-mention-notification';
 import { preNotifyService } from '~/server/service/pre-notify';
 import { normalizeLatestRevisionIfBroken } from '~/server/service/revision/normalize-latest-revision-if-broken';
 import { getYjsService } from '~/server/service/yjs';
@@ -129,12 +133,32 @@ export const updatePageHandlersFactory = (crowi: Crowi): RequestHandler[] => {
       action: SupportedAction.ACTION_PAGE_UPDATE,
     };
     const activityEvent = crowi.events.activity;
+
+    // Extract newly added @mentions from body diff and contributors for notification
+    const previousBody = previousRevision?.body ?? null;
+    const currentBody = req.body.body;
+    const getAdditionalTargetUsers = async () => {
+      const pageId = updatedPage._id;
+      const [mentionUserIds, contributorUserIds] = await Promise.all([
+        extractNewMentionUserIds(previousBody, currentBody),
+        getContributorUserIds(pageId),
+      ]);
+
+      // Deduplicate
+      const userIdSet = new Set(
+        [...mentionUserIds, ...contributorUserIds].map((id) => id.toString()),
+      );
+      const User = mongoose.model<IUserHasId>('User');
+      return User.find({ _id: { $in: [...userIdSet] } }).distinct('_id');
+    };
+
     activityEvent.emit(
       'update',
       res.locals.activity._id,
       parameters,
       { path: updatedPage.path, creator },
       preNotifyService.generatePreNotify,
+      getAdditionalTargetUsers,
     );
 
     // global notification
