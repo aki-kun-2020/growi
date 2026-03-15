@@ -1,0 +1,226 @@
+{
+  "name": "GROWI Mention Notification from Global Notification",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "growi-global-notification",
+        "responseMode": "onReceived",
+        "responseCode": 200
+      },
+      "id": "node-webhook",
+      "name": "Webhook (GROWI Global Notification)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "growi-global-notification",
+      "notes": "GROWIのグローバル通知(Slack Webhook)を受信する。\nGROWI管理画面 > グローバル通知設定 で、Slack Incoming Webhook URLの代わりにこのn8n WebhookのURLを設定する。\n\n受信データ例:\n{\n  \"channel\": \"#general\",\n  \"username\": \"GROWI\",\n  \"text\": \":bell: <https://growi.example.com/user/alice|alice> edited <https://growi.example.com/64a1b2c3d4e5f6|/path/to/page>\",\n  \"attachments\": \"[{\\\"color\\\":\\\"#263a3c\\\",\\\"text\\\":\\\"\\\",\\\"mrkdwn_in\\\":[\\\"text\\\"]}]\"\n}"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 1: Parse the Slack message from GROWI global notification\n// Extract editor username and page ID/path from the message text\n\nconst body = $input.first().json.body || $input.first().json;\nconst text = body.text || '';\n\n// Pattern: :bell: <siteUrl/user/USERNAME|USERNAME> edited <siteUrl/PAGE_ID|PAGE_PATH>\nconst editorMatch = text.match(/<[^|]+\\/user\\/([^|>]+)\\|/);\nconst pageMatch = text.match(/edited\\s+<([^|]+)\\|([^>]+)>/);\n\nif (!editorMatch || !pageMatch) {\n  // Not a page edit notification, skip\n  return [];\n}\n\nconst editor = editorMatch[1];\nconst pageUrl = pageMatch[1];\nconst pagePath = pageMatch[2];\n\n// Extract page ID from URL (last path segment)\nconst pageId = pageUrl.split('/').pop();\n\n// Extract GROWI base URL\nconst baseUrl = pageUrl.replace(new RegExp('/' + pageId + '$'), '');\n\nreturn [{\n  json: {\n    editor,\n    pageId,\n    pagePath,\n    pageUrl,\n    baseUrl,\n    originalText: text\n  }\n}];"
+      },
+      "id": "node-parse-notification",
+      "name": "Parse Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "notes": "Slack形式メッセージから編集者・ページID・パスを抽出"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.baseUrl }}/_api/v3/revisions/list",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "pageId", "value": "={{ $json.pageId }}" },
+            { "name": "limit", "value": "2" }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $credentials.growiApiToken }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-fetch-revisions",
+      "name": "Fetch Latest 2 Revisions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 300],
+      "credentials": {},
+      "notes": "GROWI API でページの最新2リビジョンを取得。\nAPI Token はGROWI管理者ユーザーのものを使用。\n\nGET /_api/v3/revisions/list?pageId=xxx&limit=2\n\nレスポンス:\n{\n  \"revisions\": [\n    { \"_id\": \"...\", \"body\": \"current body\", \"author\": {...}, \"createdAt\": \"...\" },\n    { \"_id\": \"...\", \"body\": \"previous body\", \"author\": {...}, \"createdAt\": \"...\" }\n  ],\n  \"totalCount\": 42\n}"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 2: Compute diff between revisions and extract @mentions\n\nconst input = $input.first().json;\nconst revisions = input.revisions || input.data?.revisions || [];\nconst prevItem = $('Parse Notification').first().json;\nconst editor = prevItem.editor;\nconst pagePath = prevItem.pagePath;\nconst pageUrl = prevItem.pageUrl;\nconst baseUrl = prevItem.baseUrl;\n\nif (revisions.length === 0) {\n  return [];\n}\n\nconst currentBody = revisions[0]?.body || '';\nconst previousBody = revisions.length > 1 ? (revisions[1]?.body || '') : '';\n\n// --- Diff computation ---\n// Split into lines and find added lines\nconst prevLines = new Set(previousBody.split('\\n'));\nconst currentLines = currentBody.split('\\n');\nconst addedLines = currentLines.filter(line => !prevLines.has(line));\nconst diffText = addedLines.join('\\n');\n\n// --- Extract @mentions from diff ---\nconst mentionPattern = /\\B@[\\w@.-]+/g;\nconst mentions = diffText.match(mentionPattern) || [];\nconst mentionedUsernames = [...new Set(mentions.map(m => m.slice(1)))];\n\n// --- Extract contributors from revision authors ---\nconst contributors = [...new Set(\n  revisions\n    .map(r => r.author?.username)\n    .filter(u => u != null)\n)];\n\n// --- Extract page owner (first revision author = creator) ---\n// Note: With only 2 revisions we may not have the creator.\n// The page creator info would need a separate API call if needed.\n\n// --- Combine all targets, deduplicate, exclude the editor ---\nconst allTargets = [...new Set([...contributors, ...mentionedUsernames])]\n  .filter(u => u !== editor);\n\nif (allTargets.length === 0) {\n  return [];\n}\n\n// Build notification message\nconst message = `📝 @${editor} が [${pagePath}](${pageUrl}) を編集しました\\n`\n  + `👥 関係者: ${allTargets.map(u => '@' + u).join(' ')}`;\n\nconst mentionOnlyTargets = mentionedUsernames.filter(u => u !== editor);\n\nreturn [{\n  json: {\n    editor,\n    pagePath,\n    pageUrl,\n    baseUrl,\n    diffText,\n    mentionedUsernames: mentionOnlyTargets,\n    contributors: contributors.filter(u => u !== editor),\n    allTargets,\n    message\n  }\n}];"
+      },
+      "id": "node-extract-mentions",
+      "name": "Extract Mentions from Diff",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "notes": "前回リビジョンとの差分から新規@メンションを抽出し、コントリビューターと統合・重複排除・編集者除外"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [],
+          "string": [
+            {
+              "value1": "={{ $json.allTargets.length }}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        }
+      },
+      "id": "node-check-targets",
+      "name": "Has Notification Targets?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1120, 300],
+      "notes": "通知対象がいない場合はスキップ"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Split each target user into a separate item for individual notification\nconst input = $input.first().json;\n\nreturn input.allTargets.map(username => ({\n  json: {\n    targetUsername: username,\n    editor: input.editor,\n    pagePath: input.pagePath,\n    pageUrl: input.pageUrl,\n    baseUrl: input.baseUrl,\n    message: input.message,\n    isMentioned: input.mentionedUsernames.includes(username),\n    isContributor: input.contributors.includes(username)\n  }\n}));"
+      },
+      "id": "node-split-targets",
+      "name": "Split into Individual Targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 200],
+      "notes": "各通知対象ユーザーを個別アイテムに分割"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.baseUrl }}/_api/v3/notification-setting/global-notification",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $credentials.growiApiToken }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "channel", "value": "={{ '@' + $json.targetUsername }}" },
+            { "name": "text", "value": "={{ $json.message }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-send-chat-option-a",
+      "name": "Send Chat Notification (Slack DM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 100],
+      "notes": "Option A: Slack API経由でDM通知を送信。\n実際のSlack APIを使う場合は n8n-nodes-base.slack ノードに置き換え、\nchat.postMessage で @username にDMを送る。"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.baseUrl }}/_api/v3/personal-setting/in-app-notification",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $credentials.growiApiToken }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "targetUser", "value": "={{ $json.targetUsername }}" },
+            { "name": "message", "value": "={{ $json.message }}" },
+            { "name": "path", "value": "={{ $json.pagePath }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-send-chat-option-b",
+      "name": "Send In-App Notification (GROWI API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 300],
+      "notes": "Option B: GROWI内蔵のin-app通知APIに直接送信。\n※ GROWIの標準APIにはこのエンドポイントはないため、\n  実際にはSlack DMまたはメール通知を使うのが現実的。"
+    },
+    {
+      "parameters": {},
+      "id": "node-noop",
+      "name": "No Targets - Skip",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1340, 400],
+      "notes": "通知対象なし - 何もしない"
+    }
+  ],
+  "connections": {
+    "Webhook (GROWI Global Notification)": {
+      "main": [[{ "node": "Parse Notification", "type": "main", "index": 0 }]]
+    },
+    "Parse Notification": {
+      "main": [
+        [{ "node": "Fetch Latest 2 Revisions", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Latest 2 Revisions": {
+      "main": [
+        [{ "node": "Extract Mentions from Diff", "type": "main", "index": 0 }]
+      ]
+    },
+    "Extract Mentions from Diff": {
+      "main": [
+        [{ "node": "Has Notification Targets?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Has Notification Targets?": {
+      "main": [
+        [
+          {
+            "node": "Split into Individual Targets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [{ "node": "No Targets - Skip", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split into Individual Targets": {
+      "main": [
+        [
+          {
+            "node": "Send Chat Notification (Slack DM)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send In-App Notification (GROWI API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "growi-mention-notification"
+  }
+}
